@@ -9,15 +9,16 @@ from infolog import log
 from librosa import effects
 from tacotron.models import create_model
 from tacotron.utils import plot
-from tacotron.utils.text import text_to_sequence
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
+from tacotron.utils.text import text_to_sequence_MIX_Phoneme_Version
+# import matplotlib.pyplot as plt
+# from sklearn.manifold import TSNE
 
 class Synthesizer:
 	def load(self, checkpoint_path, hparams, gta=False, model_name='Tacotron'):
 		log('Constructing model: %s' % model_name)
 		#Force the batch size to be known in order to use attention masking in batch synthesis
 		inputs = tf.placeholder(tf.int32, (None, None), name='inputs')
+		inputs_tone_stress = tf.placeholder(tf.int32, (None, None), name='inputs_tone_stress')
 		speaker_labels = tf.placeholder(tf.int32, (None, ), 'speaker_labels')
 		language_labels = tf.placeholder(tf.int32, (None, ), 'language_labels')
 		input_lengths = tf.placeholder(tf.int32, (None, ), name='input_lengths')
@@ -26,18 +27,18 @@ class Synthesizer:
 		with tf.variable_scope('Tacotron_model') as scope:
 			self.model = create_model(model_name, hparams)
 			if gta:
-				self.model.initialize(inputs, speaker_labels, language_labels, input_lengths, targets, gta=gta, split_infos=split_infos)
+				self.model.initialize(inputs, inputs_tone_stress, speaker_labels, language_labels, input_lengths, targets, gta=gta, split_infos=split_infos)
 			else:
-				self.model.initialize(inputs, speaker_labels, language_labels, input_lengths, split_infos=split_infos)
+				self.model.initialize(inputs, inputs_tone_stress, speaker_labels, language_labels, input_lengths, split_infos=split_infos)
 
 			self.mel_outputs = self.model.tower_mel_outputs
 			self.linear_outputs = self.model.tower_linear_outputs if (hparams.predict_linear and not gta) else None
 			self.alignments = self.model.tower_alignments
 			self.stop_token_prediction = self.model.tower_stop_token_prediction
 			self.targets = targets
-			self.text_table=self.model.embedding_table
+			self.text_phoneme_table=self.model.phoneme_embedding_table
 			self.speaker_table = self.model.speaker_embedding_table
-			self.language_table = self.model.language_embedding_table
+			# self.language_table = self.model.language_embedding_table
 
 
 		self.gta = gta
@@ -52,6 +53,7 @@ class Synthesizer:
 			self._target_pad = 0.
 
 		self.inputs = inputs
+		self.inputs_tone_stress = inputs_tone_stress
 		self.speaker_labels=speaker_labels
 		self.language_labels=language_labels
 		self.input_lengths = input_lengths
@@ -83,20 +85,39 @@ class Synthesizer:
 				mel_filenames.append(mel_filenames[-1])
 
 		assert 0 == len(texts) % self._hparams.tacotron_num_gpus
-		seqs = [np.asarray(text_to_sequence(text, cleaner_names)) for text in texts]
-		input_lengths = [len(seq) for seq in seqs]
 
-		size_per_device = len(seqs) // self._hparams.tacotron_num_gpus
+		# 下面是代替原来的那句话
+		# 原来的: seqs = [np.asarray(text_to_sequence_MIX_Phoneme_Version(text, cleaner_names)) for text in texts]
+		phoneme_seqs = []
+		tone_stress_seqs = []
+		for text in texts:
+			text = text.strip()
+			res = text_to_sequence_MIX_Phoneme_Version(text, cleaner_names)
+			phoneme_seqs.append(np.asarray(res[0]))
+			tone_stress_seqs.append(np.asarray(res[1]))
+
+		
+		input_lengths = [len(seq) for seq in phoneme_seqs]
+
+		size_per_device = len(phoneme_seqs) // self._hparams.tacotron_num_gpus
 
 		#Pad inputs according to each GPU max length
-		input_seqs = None
+		input_phoneme_seqs = None
+		input_tone_stress_seqs = None
 		input_speaker_labels = None
 		input_language_labels = None
 		split_infos = []
 		for i in range(self._hparams.tacotron_num_gpus):
-			device_input = seqs[size_per_device*i: size_per_device*(i+1)]
-			device_input, max_seq_len = self._prepare_inputs(device_input)
-			input_seqs = np.concatenate((input_seqs, device_input), axis=1) if input_seqs is not None else device_input
+			device_phoneme_input = phoneme_seqs[size_per_device*i: size_per_device*(i+1)]
+			device_phoneme_input, max_seq_len = self._prepare_inputs(device_phoneme_input)
+			input_phoneme_seqs = np.concatenate((input_phoneme_seqs, device_phoneme_input), axis=1) if input_phoneme_seqs is not None else device_phoneme_input
+
+
+			device_tone_stress_input = tone_stress_seqs[size_per_device*i: size_per_device*(i+1)]
+			device_tone_stress_input, max_seq_len = self._prepare_inputs_tone_stress(device_tone_stress_input)
+			input_tone_stress_seqs = np.concatenate((input_tone_stress_seqs, device_tone_stress_input), axis=1) if input_tone_stress_seqs is not None else device_tone_stress_input
+
+
 
 			device_speaker_label = speaker_labels[size_per_device*i: size_per_device*(i+1)]
 			input_speaker_labels = np.concatenate((input_speaker_labels, device_speaker_label), axis=0) if input_speaker_labels is not None else device_speaker_label
@@ -106,7 +127,8 @@ class Synthesizer:
 			split_infos.append([max_seq_len, 0, 0, 0])
 
 		feed_dict = {
-			self.inputs: input_seqs,
+			self.inputs: input_phoneme_seqs,
+			self.inputs_tone_stress: input_tone_stress_seqs,
 			self.speaker_labels: input_speaker_labels,
 			self.language_labels: input_language_labels,
 			self.input_lengths: np.asarray(input_lengths, dtype=np.int32),
@@ -207,17 +229,18 @@ class Synthesizer:
 			saved_mels_paths.append(mel_filename)
 
 			if log_dir is not None:
-				#save wav (mel -> wav)
-				wav = audio.inv_mel_spectrogram(mel.T, hparams)
-				audio.save_wav(wav, os.path.join(log_dir, 'wavs/wav-{}-mel.wav'.format(basenames[i])), sr=hparams.sample_rate)
+				# 先不存mel
+				# save wav (mel -> wav)
+				# wav = audio.inv_mel_spectrogram(mel.T, hparams)
+				# audio.save_wav(wav, os.path.join(log_dir, 'wavs/wav-{}-mel.wav'.format(basenames[i])), sr=hparams.sample_rate)
 
 				#save alignments
 				plot.plot_alignment(alignments[i], os.path.join(log_dir, 'plots/alignment-{}.png'.format(basenames[i])),
-					title='{}'.format(texts[i]), split_title=True, max_len=target_lengths[i])
+					title='{}'.format('XXXXXXXXXXXXXXX'), split_title=True, max_len=target_lengths[i])
 
 				#save mel spectrogram plot
 				plot.plot_spectrogram(mel, os.path.join(log_dir, 'plots/mel-{}.png'.format(basenames[i])),
-					title='{}'.format(texts[i]), split_title=True)
+					title='{}'.format('XXXXXXXXXXXXXXX'), split_title=True)
 
 				if hparams.predict_linear:
 					#save wav (linear -> wav)
@@ -226,7 +249,7 @@ class Synthesizer:
 
 					#save linear spectrogram plot
 					plot.plot_spectrogram(linears[i], os.path.join(log_dir, 'plots/linear-{}.png'.format(basenames[i])),
-						title='{}'.format(texts[i]), split_title=True, auto_aspect=True)
+						title='{}'.format('XXXXXXXXXXXXXXX'), split_title=True, auto_aspect=True)
 
 
 
@@ -240,8 +263,16 @@ class Synthesizer:
 		max_len = max([len(x) for x in inputs])
 		return np.stack([self._pad_input(x, max_len) for x in inputs]), max_len
 
+	def _prepare_inputs_tone_stress(self, inputs_tone_stress):
+		max_len = max([len(x) for x in inputs_tone_stress])
+		pad_val = inputs_tone_stress[0][-1]
+		return np.stack([self._pad_input_tone_stress(x, max_len, pad_val) for x in inputs_tone_stress]), max_len
+
 	def _pad_input(self, x, length):
 		return np.pad(x, (0, length - x.shape[0]), mode='constant', constant_values=self._pad)
+
+	def _pad_input_tone_stress(self, x, length, value):
+		return np.pad(x, (0, length - x.shape[0]), mode='constant', constant_values=value)
 
 	def _prepare_targets(self, targets, alignment):
 		max_len = max([len(t) for t in targets])

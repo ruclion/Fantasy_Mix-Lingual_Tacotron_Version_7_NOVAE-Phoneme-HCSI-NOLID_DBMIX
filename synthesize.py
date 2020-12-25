@@ -58,7 +58,7 @@ def main(websen=None, weight=''):
 	parser.add_argument('--output_dir', default='output/', help='folder to contain synthesized mel spectrograms')
 	parser.add_argument('--mode', default='eval', help='mode of run: can be one of {}'.format(accepted_modes))
 	parser.add_argument('--GTA', default='True', help='Ground truth aligned synthesis, defaults to True, only considered in synthesis mode')
-	parser.add_argument('--text_list', default='sentences_v1.txt', help='Text file contains list of texts to be synthesized. Valid if mode=eval')
+	parser.add_argument('--text_list', default='sentences_phoneme_v1.txt', help='Text file contains list of texts to be synthesized. Valid if mode=eval')
 	parser.add_argument('--speaker_id', default=None, help='Defines the speakers ids to use when running standalone Wavenet on a folder of mels. this variable must be a comma-separated list of ids')
 	args = parser.parse_args(args=[])
 
